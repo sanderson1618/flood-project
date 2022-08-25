@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Oct 26 17:39:00 2021
+
+@author: angelmonsalve
+
+Test file for variable roughness and variable rainfall
+
+"""
+
+""" Loads componesnts and other libraries"""
+%reset -f
+import numpy as np
+import pandas as pd
+import copy
+import os
+from matplotlib import pyplot as plt
+from landlab.components import OverlandFlowVarRoughnessRainfall, BedloadTransport
+from landlab.grid.mappers import map_mean_of_link_nodes_to_link
+from landlab.io import read_esri_ascii
+from landlab import imshow_grid
+
+""" Numerical simulation conditions and time control settings"""
+bedElevationDEM = 'testChannel.asc'                     # ASCII raster DEM containing the bed surface elevation
+bedRoughnessRaster = 'testChannelRoughness.asc'         # ASCII raster containing the Manning's roughness coefficient
+bedGSDLocationRaster = 'testChannelGSDLocation.asc'     # ASCII raster containing the grain size distribution location
+rainfallIntensityRaster = 'testChannelRainfall.asc'     # ASCII raster containing the rainfall intensity in mm/hr
+
+dtPrecision = 3         # Avoids rounding errors
+max_dt = 20            # Using only the default time step calculator gives some unstable results. This low value ensures more stables results use it in seconds
+tPlot = 600             # Plots will be get every this seconds
+storeData = 600         # Stores results every this time
+model_run_time = 60000  # Maximum simulation time
+
+storm_starts = 0.0         # Time when precipitation event starts
+storm_ends = 60000          # Time when precipitation event ends
+
+link_to_sample = 12 # Link from where samples will be collected. Use landlab format (column format)
+node_to_sample = 13 # Node from where samples will be collected. Use landlab format (column format)
+
+""" Now everything are calculations, no more inputs are required"""
+
+""" Remove previous figures"""
+directory = os.getcwd() ; test = os.listdir( directory )
+
+for item in test:
+    if item.endswith(".png"):
+        os.remove( os.path.join( directory, item ) )
+        
+"""what are the variables names requiered by OverlandFlow and BedloadTransport? These lines display the required variables"""
+OverlandFlowVarRoughnessRainfall.input_var_names
+BedloadTransport.input_var_names
+
+# Reads all rasters containing bed elevation, roughness, GSD location, and Rainfall intensity
+(rmg, z) = read_esri_ascii(bedElevationDEM, name='topographic__elevation') 
+(rmg0, n) = read_esri_ascii(bedRoughnessRaster)            # n is Manning's roughness coefficient
+(rmg0, I) = read_esri_ascii(rainfallIntensityRaster)       # I is rainfall intensity in mm/hr
+(rmg0, gsd_loc) = read_esri_ascii(bedGSDLocationRaster)    # gsd_loc contains the index for each GSD location
+del rmg0 # It is not required
+
+"""Configuring all topographic and flow variables related required by overland flow
+ Initialize the variables - All are dry at the beginning """
+rmg.add_zeros('surface_water__depth', at = 'node')
+rmg.add_zeros('surface_water__discharge', at='link')
+rmg.add_zeros('surface_water__discharge', at='node')
+
+# Set boundaries as closed boundaries, the outlet is set to an open boundary.
+rmg.set_watershed_boundary_condition(z)  
+
+# From slopes at nodes calculates slopes at links as averaged over neighboring patches
+rmg.at_node['topographic__slope'] = rmg.calc_slope_at_node(elevs='topographic__elevation') 
+# imshow_grid(rmg,'topographic__slope');plt.show() # Uncomment to display the slopes
+
+# Converts roughness from node to link. Then, converts precipitation from mm/hr to m/s
+rmg['link']['topographic__roughness'] = map_mean_of_link_nodes_to_link(rmg,n) 
+rmg['node']['rainfall_intensity'] = I * (2.77778 * 10 ** -7)
+rmg['node']['bed_grain_size_distribution__location'] = gsd_loc      
+
+# Reads the GSD from an xlsx file
+gsd = pd.read_excel('GSD.xlsx',sheet_name='GSD',skiprows=0).values
+
+""" Plots and saves the initial DEM """
+imshow_grid(rmg,'topographic__elevation',cmap='pink',vmin=0,plot_name='Topographic Elevation [m]')
+plt.savefig('topographicElevation.png',dpi=600)
+plt.close()
+
+""" Plots and saves the GSD location """
+imshow_grid(rmg,'bed_grain_size_distribution__location',cmap='Greens',vmin=0,plot_name='GSD Location [m]')
+plt.savefig('locationGSD.png',dpi=600)
+plt.close()
+
+""" Creates a copy of the original z for plotting purposes """
+z0 = copy.deepcopy(z)                
+
+""" Instantiation """
+of = OverlandFlowVarRoughnessRainfall(rmg, steep_slopes=True, alpha = 0.3, dt_max=max_dt)
+qb = BedloadTransport(rmg , gsd = gsd)
+
+""" Defines some variables to store data """
+elapsed_time = 0.0      # Initializates the variable
+storeNow=1;plotNow=1    # Used to save the plot at time zero
+tPlotOrg=copy.deepcopy(tPlot)                   # A copy of tPlot
+storeDataOrg=copy.deepcopy(storeData)           # A copy of tPlot
+
+discharge_at_outlet = np.zeros((1,2))
+depth_at_outlet = np.zeros((1,2))
+tau_at_outlet = np.zeros((1,2))
+
+# The previous and current velocities are contained in each time step. 
+# With them, the du/dt term can be calculated in the shear stresses calculations
+u0 = np.vstack((np.zeros_like(of._q),np.zeros_like(of._q)))   
+
+while elapsed_time < model_run_time:
+             
+    """ Calculates the rainfall """
+    if (elapsed_time >= storm_starts) and (elapsed_time <= storm_ends):
+        # When is effective rainfall is set to the grid
+        rmg['node']['rainfall_intensity'] = I * (2.77778 * 10 ** -7) 
+    else: # if elapsed time exceeds the storm duration, rainfall ceases.
+        rmg['node']['rainfall_intensity'] = I*0
+   
+    """ Runs overland flow for one time step """ 
+    of.overland_flow()  # Generating overland flow based on the deAlmeida solution.
+    qb._dt = of.dt      # Assigns overland flow dt to calculate time derivatives
+    
+    """ Updates u0 """   
+    u0[0,:] = u0[1,:]               # What was the current discharge is now the previous one
+    u0[1,:] = of._q / of._h_links   # Now the velocity is updated    
+    
+    """ Runs bedload transport for one time step """ 
+    qb.run_one_step(u0)
+    
+    ## Append time and discharge to their lists to save data and for plotting.
+    storeData = round(storeData-of.dt, dtPrecision)
+    if (storeData <=0) or (storeNow==1):
+        print('Storing results at time :',np.round(elapsed_time,1),' s')
+        discharge_at_outlet = np.vstack((discharge_at_outlet , (elapsed_time, np.abs(of._q[link_to_sample] * rmg.dx))))
+        depth_at_outlet = np.vstack((depth_at_outlet , (elapsed_time, of._h[node_to_sample])))
+        tau_at_outlet = np.vstack((tau_at_outlet , (elapsed_time, np.abs(qb._tau[link_to_sample]))))
+        storeData = round(storeDataOrg, dtPrecision)
+        storeNow=0
+
+    tPlot = round(tPlot-of.dt, dtPrecision)
+    if tPlot <= 0  or (plotNow==1):
+        print('Elapsed time :',np.round(elapsed_time,1),' s. Current dt =',np.round(of.dt,1),' s - Saving the plot')
+        v = qb.vector_mapper(of._q)
+        plot_name='Surface water depth [m] at ' + str(np.round(elapsed_time,0)) + ' sec'
+        imshow_grid(rmg, 'surface_water__depth',cmap='Blues',vmin=0,vmax=0.15,plot_name=plot_name)
+        plt.quiver(rmg.x_of_node,rmg.y_of_node,qb._vector[:,0],qb._vector[:,1])
+        output='depth_'+str(np.round(elapsed_time,0))+'.png'
+        plt.savefig(output,dpi=600); plt.close()
+        plotNow=0
+        tPlot = tPlotOrg
+
+    ## Updating elapsed_time
+    elapsed_time = round(elapsed_time + of.dt, dtPrecision)
+
+## Plotting the very last time step
+v = qb.vector_mapper(of._q)
+plot_name='Surface water depth [m] at ' + str(np.round(elapsed_time,0)) + ' sec'
+imshow_grid(rmg, 'surface_water__depth',cmap='Blues',vmin=0,vmax=0.15,plot_name=plot_name)
+plt.quiver(rmg.x_of_node,rmg.y_of_node,qb._vector[:,0],qb._vector[:,1])
+output='depth_'+str(np.round(elapsed_time,0))+'.png'
+plt.savefig(output,dpi=600);plt.close()
+
+## Hydrograph at the outlet
+plt.figure(1)
+plt.plot(discharge_at_outlet[:,0], discharge_at_outlet[:,1], color='mediumblue')
+plt.ylabel('Discharge (cms)')
+plt.xlabel('Time (seconds)')
+plt.ylim(0,4)
+plt.title('Hydrograph at Watershed Outlet')
+plt.savefig('HydrographAtOutlet.png',dpi=600);plt.close()
+
+## Water depth at the outlet
+plt.figure(2)
+plt.plot(depth_at_outlet[:,0], depth_at_outlet[:,1], color='mediumblue')
+plt.ylabel('Depth (m)')
+plt.xlabel('Time (seconds)')
+plt.ylim(0,0.2)
+plt.title('Water depth at Watershed Outlet')
+plt.savefig('WaterDepthAtOutlet.png',dpi=600);plt.close()
+
+## Shear stress at the outlet
+plt.figure(3)
+plt.plot(tau_at_outlet[:,0], tau_at_outlet[:,1], color='mediumblue')
+plt.ylabel('Shear Stress (Pa)')
+plt.xlabel('Time (seconds)')
+plt.ylim(0,2)
+plt.title('Shear stress at Watershed Outlet')
+plt.savefig('ShearStressAtOutlet.png',dpi=600);plt.close()
+
+""" Test """
+tau = np.abs(qb._tau[12])
+bedloadRate = qb._bedloadRate[12]
+uStar = np.sqrt(tau/1000)
+bedloadGSD = qb._p[12]
