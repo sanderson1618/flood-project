@@ -33,7 +33,7 @@ elif basin_flag == 'LC3':
  
 # Precipitation inputs, 10min duration (600s)
 # Used the precip_intensity sheet, which gives depth(in)/time(hr), 
-# The conversion from (in/hr) to (m/s) is 7.05556 * 10 ** -6
+# The conversion from (in/hr) to (m/s) is 7.05556 * 10 ** -6d
 if storm_flag == "1hr_1000yrStorm":
     precip_inhr = 13.3
     precip_ms = precip_inhr * (7.05556 * 10 ** -6) 
